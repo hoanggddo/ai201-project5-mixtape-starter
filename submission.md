@@ -163,12 +163,94 @@ correctly and that rating your own song produces no notification.
 
 ### Issue #1 — My listening streak keeps resetting
 
-*(To be filled in after fix)*
+**How I reproduced it**
+
+Used the flask shell to call `update_listening_streak()` directly with
+controlled datetime inputs, since the bug only occurs on Sundays and the
+actual date can't be controlled. Created a test User object with
+`listening_streak=1`, called the function with a Saturday datetime
+(`2024-06-15`), then immediately called it again with the following Sunday
+(`2024-06-16`). The streak printed as 1 both times — it should have
+incremented to 2 on Sunday.
+
+**How I found the root cause**
+
+Traced the call chain: `POST /songs/<id>/listen` → `routes/songs.py` →
+`streak_service.record_listening_event()` → `update_listening_streak()`.
+Read `update_listening_streak()` and found the consecutive-day branch:
+`elif days_since_last == 1 and today.weekday() != 6`. The `weekday() != 6`
+condition immediately stood out — weekday() returns 6 for Sunday, so this
+condition was explicitly blocking the increment whenever today is Sunday,
+even when the user genuinely listened on consecutive days.
+
+**The root cause**
+
+Python's `datetime.weekday()` returns 6 for Sunday. The streak increment
+branch had an extra guard — `today.weekday() != 6` — which prevented the
+streak from incrementing any time the current day was Sunday. So a user who
+listened Saturday and Sunday would have `days_since_last == 1` (correct) but
+the condition still failed because Sunday's weekday value is 6. The streak
+reset to 1 instead of incrementing. The condition should only check whether
+exactly one day has passed — the day of the week is irrelevant.
+
+**The fix and side-effect check**
+
+Removed the `and today.weekday() != 6` clause, leaving just:
+
+```python
+elif days_since_last == 1:
+```
+
+Verified the fix in the flask shell — streak now correctly increments from 1
+to 2 when listening on Saturday then Sunday. Ran `pytest tests/test_streaks.py`
+— all 5 tests pass, including `test_streak_increments_on_sunday` and
+`test_streak_resets_after_skipped_day`, confirming the fix doesn't break the
+reset logic for skipped days.
 
 ---
 
 ### Issue #5 — The last song in a playlist never shows up
 
-*(To be filled in after fix)*
+**How I reproduced it**
 
----
+Hit `GET /playlists/<id>/songs` for the "Late Night Vibes" playlist, which
+the seed data populates with 7 songs. The response returned `count: 6` with
+"Free Throws" (the 7th song) missing. Checked all three seeded playlists —
+each returned one fewer song than expected.
+
+**How I found the root cause**
+
+Traced the call chain: `GET /playlists/<id>/songs` → `routes/playlists.py` →
+`playlist_service.get_playlist_songs()`. Read the function and found it
+queries songs ordered by position correctly, but the return statement was
+`return [song.to_dict() for song in songs[:-1]]`. The `[:-1]` slice in Python
+drops the last element of a list — so the last song was being excluded on
+every single call regardless of playlist size.
+
+**The root cause**
+
+The return statement in `get_playlist_songs()` used `songs[:-1]` instead of
+`songs`. Python's `[:-1]` slice returns all elements except the last one.
+There is no valid reason to exclude the last song — this appears to be an
+accidental off-by-one introduced during development. Every playlist was
+silently returning one fewer song than it actually contained.
+
+**The fix and side-effect check**
+
+Changed the return statement from:
+
+```python
+return [song.to_dict() for song in songs[:-1]]
+```
+
+to:
+
+```python
+return [song.to_dict() for song in songs]
+```
+
+Verified by hitting the playlist endpoint again — count went from 6 to 7 and
+"Free Throws" appeared. Ran `pytest tests/test_playlists.py` — all 3 tests
+pass including `test_playlist_returns_all_songs` and
+`test_empty_playlist_returns_empty_list`, confirming empty playlists still
+return an empty list without error.
